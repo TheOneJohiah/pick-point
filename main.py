@@ -247,9 +247,10 @@ class Main:
 
                             # Prep to create command
                             if (selected_item is not None):
+                                
                                 # Translate to arm coordinates
-                                arm_x = float((selected_item.x * x_conversion_const - x_shift_const) * x_final_const)
-                                arm_y = float(selected_item.y * y_conversion_const)
+                                arm_x, arm_y = self.get_arm_coordinates(selected_item)
+
                                 drop_off = ""
 
 
@@ -362,6 +363,11 @@ class Main:
             self._logger.debug('Joining Vision Thread')
             self._vision_thread.join()
             self._gui_thread.join()
+
+    def get_arm_coordinates(selected_item):
+        arm_x = float((selected_item.x * x_conversion_const - x_shift_const) * x_final_const)
+        arm_y = float(selected_item.y * y_conversion_const)
+        return arm_x, arm_y
 
     def get_camera_images(self):
         """
