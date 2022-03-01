@@ -72,7 +72,9 @@ class SSHThread(threading.Thread):
 
             if (current_command != "QUIT"):
                 # Exec the python script
-                stdin, stdout, stderr = self.client.exec_command('source ~/catkin_ws/devel/setup.bash && export PYTHONPATH=${PYTHONPATH}:/home/niryo/catkin_ws/src/niryo_one_python_api/src/niryo_python_api && python listenerv2.py')
+                stdin, stdout, stderr = self.client.exec_command('source ~/catkin_ws/devel/setup.bash && '
+                'export PYTHONPATH=${PYTHONPATH}:/home/niryo/catkin_ws/src/niryo_one_python_api/src/niryo_python_api && '
+                'python listenerv2.py')
 
                 stdin.write(current_command)
                 stdin.flush()
