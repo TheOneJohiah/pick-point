@@ -20,35 +20,28 @@ import datetime
 import traceback
 import copy
 import time
+import configparser
 
 from SQL_Driver import ObjectDB
 from Item import Item
 from VisionThread import VisionThread
-from SSH_Thread import SSHThread
 from GUI import GUI
+
+from pyniryo import *
 
 LOG_LEVEL_CMD = logging.WARNING         # The min log level that will be displayed in the console
 LOG_DIR = 'Logs'                        # Directory to save log files to
 LEFT_CAMERA_SERIAL_NUM = '18585124'     # Left stereo camera ID
 RIGHT_CAMERA_SERIAL_NUM = '18585121'    # Right stereo camera ID
 GRAPH_TYPE = 'SSD_INCEPTION_V2'         # Network graph model to use for object detection
-INCHES_PER_PIXEL = 0.015735782          # Number of inches each pixel represents at the datum
 IMAGE_DOWNSCALE_RATIO = 0.5             # Downscale ratio for machine learning
-x_shift_const = 0.4
-x_conversion_const = x_shift_const/640.5 #Shift amount/middle pixel value
-x_final_const = 0.980858545
-y_conversion_const = 0.000515
-min_x_val = -0.25
-min_y_val = 0.14
-max_x_val = 0.25
-max_y_val = 0.37
 picked_items = []
 
 sorting_coords = {
-    "bird":"DROP -0.014 0.298 0.25 -0.296 1.530 1.346",
-    "cat": "DROP 0.003 -0.152 0.25 -0.050 1.395 -1.571",
-    "dog": "DROP 0.000 -0.257 0.25 0.070 1.410 -1.496",
-    "home": "MOVE 0.077 0.001 0.159 -0.023 1.322 0.017"
+    "bird": [-0.014, 0.298, 0.25, -0.296, 1.530, 1.346],
+    "cat":  [0.003, -0.152, 0.25, -0.050, 1.395, -1.571],
+    "dog":  [0.000, -0.257, 0.25, 0.070, 1.410, -1.496],
+    "home": [0.12, 0.0, 0.15, 0.0, 1.57, 0.0],
 }
 
                                         #    1  = process the full image (more accurate)
@@ -72,6 +65,23 @@ GUI_MESSAGES = dict(
 
 
 class Main:
+
+    # config_variables: all the variables that need to be read from the config file
+    # each "north, east, south west" coordinate system describes the four bounds according to one device, FLIR camera, Niryo arm, or Zed depth sensor
+    config_variables = {
+        'camera_coordinates': {
+            'north': 0.0,
+            'east':  0.0,
+            'south': 0.0,
+            'west':  0.0,
+        },
+        'arm_coordinates': {
+            'north': 0.0,
+            'east':  0.0,
+            'south': 0.0,
+            'west':  0.0,
+        },
+    }
 
     def __init__(self):
         """
@@ -104,6 +114,9 @@ class Main:
         self._logger.addHandler(console_handler)
         # =====================================================================
 
+        # read data from config file
+        self.parse_config()
+
         # Setup GUI
         self._logger.debug('Initializing GUI Thread')
         self._gui_thread = GUI()
@@ -122,10 +135,9 @@ class Main:
         self._logger.debug('Initializing Vision Thread')
         self._vision_thread = VisionThread(LEFT_CAMERA_SERIAL_NUM, RIGHT_CAMERA_SERIAL_NUM, GRAPH_TYPE, LOG_DIR,
                                            IMAGE_DOWNSCALE_RATIO)
-
-        # Setup SSH
-        self._ssh_thread = SSHThread.SSHThread()
-
+        # start TCP connection
+        self.robot = NiryoRobot("10.10.10.10")
+        self.robot.calibrate_auto()
 
         # Setup local variables
         self._camera_result = None
@@ -153,11 +165,8 @@ class Main:
             self._logger.debug('Starting Vision Thread')
             self._vision_thread.start()
 
-            self._logger.debug('Starting SSH Thread')
-            self._ssh_thread.start()
-            self._ssh_thread._append_command(sorting_coords['home'])
-            self._ssh_thread._append_command("OPEN")
-            self._ssh_thread._append_command("CLOSE")
+            self._logger.debug('Homing Arm')
+            self.robot.move_pose(sorting_coords["home"])
 
             while self._gui_thread.is_alive():      # Keep going until the GUI thread dies
                 vision_task_thread = None
@@ -209,29 +218,6 @@ class Main:
 
                         # Get the X, Y, Z coords of the object
                         requested_item = self._sql_result[0]
-                        x = "N/A"
-                        y = "N/A"
-                        z = "N/A"
-
-                        with self._current_item_list_lock:
-                            for item in self._current_item_list:
-                                if item.item_type == requested_item.item_type:
-                                    x = "%0.4f in" % (item.x * size[1] * INCHES_PER_PIXEL)
-                                    y = "%0.4f in" % (item.y * size[0] * INCHES_PER_PIXEL)
-                                    z = "%0.4f in" % item.z
-                                    print("x = %s, y = %s, z = %s" % (x, y, z))
-                                    break
-
-
-                        # Get the image coordinates
-                        item_x = self._vision_thread._get_x()
-                        x = item_x
-                        item_y = self._vision_thread._get_y()
-                        y = item_y
-                        z = 0
-                        print("Tried to get image coordinates")
-
-                        print("Item-X: {}, Item-Y: {}".format(item_x, item_y))
 
                         # If recognized items are not empty
                         if (self.get_current_item_list):
@@ -248,8 +234,9 @@ class Main:
                             # Prep to create command
                             if (selected_item is not None):
                                 # Translate to arm coordinates
-                                arm_x = float((selected_item.x * x_conversion_const - x_shift_const) * x_final_const)
-                                arm_y = float(selected_item.y * y_conversion_const)
+                                arm_x, arm_y = self.convert_coordinates(selected_item.x, selected_item.y,
+                                 self.config_variables['camera_coordinates'],
+                                  self.config_variables['arm_coordinates'])
                                 drop_off = ""
 
 
@@ -268,11 +255,14 @@ class Main:
 
 
 
-                                print("Appending instructions for {} X={} Y={}".format(selected_item.item_type, selected_item.y, selected_item.x))
+                                print("Appending instructions for {} X={} Y={}".format(selected_item.item_type, selected_item.x, selected_item.y))
                                 
                                 print("Translated Coordinates: Arm_x: {} Arm_y: {}".format(arm_x, arm_y))
                                 # Check if in bounds
-                                if ((arm_x >= min_x_val and arm_x <= max_x_val) and (arm_y >= min_y_val and arm_y <= max_y_val)):
+                                if (arm_x >= self.config_variables['arm_coordinates']['west']
+                                 and arm_x <= self.config_variables['arm_coordinates']['east']
+                                  and arm_y >= self.config_variables['arm_coordinates']['north']
+                                   and arm_y <= self.config_variables['arm_coordinates']['south']):
                                 
                                     # Default rotation
                                     applied_rotation = 0
@@ -284,19 +274,25 @@ class Main:
 
                                     # MOVE ABOVE THEN PICK X Y Z ROLL PITCH YAW
                                     # Arm flips x and y
-                                    self._ssh_thread._append_command("MOVE {} {} {} {} {} {}".format(arm_y, arm_x, 0.1 + .18, applied_rotation, 1.4, 0))
-                                    self._ssh_thread._append_command("PICK {} {} {} {} {} {}".format(arm_y, arm_x, 0.1, applied_rotation, 1.4, 0))
+                                    self.robot.move_pose(arm_y, arm_x, 0.1 + .18, applied_rotation, 1.4, 0)
+                                    self.robot.release_with_tool()
+
+                                    self.robot.move_pose(arm_y, arm_x, 0.1, applied_rotation, 1.4, 0)
+                                    self.robot.grasp_with_tool()
+                                    
 
                                     # SHIFT AXIS AMOUNT
                                     # Move out of the way
-                                    self._ssh_thread._append_command("MOVE {} {} {} {} {} {}".format(arm_y, arm_x, 0.35, applied_rotation, 1.4, 0))
+                                    self.robot.move_pose(arm_y, arm_x, 0.35, applied_rotation, 1.4, 0)
 
                                     # DROP OFF POINT
-                                    self._ssh_thread._append_command(drop_off)
+                                    self.robot.move_pose(drop_off)
+                                    self.robot.release_with_tool()
+                                    self.robot.grasp_with_tool()
 
                                     # Move Home if drop_off not at Home
                                     if (drop_off != sorting_coords['home']):
-                                        self._ssh_thread._append_command(sorting_coords['home'])
+                                        self.robot.move_pose(sorting_coords["home"])
 
                                 else:
                                     print("Error appending instructions... Out of Bounds")
@@ -304,44 +300,7 @@ class Main:
                             else:
                                 print("No Objects Identified")
 
-
-                        """
-                        if ((item_x is not None) and (item_y is not None)):
-                            # Translate to arm coordinates
-                            arm_x = float((item_x * x_conversion_const - x_shift_const) * x_final_const)
-                            arm_y = float(item_y * y_conversion_const)
-                            # PICK X Y Z ROLL PITCH YAW
-                            # Arm flips x and y
-                            self._ssh_thread._append_command("PICK {} {} {} {} {} {}".format(arm_y, arm_x, 0.1, 0, 1.4, 0))
-
-                            # SHIFT AXIS AMOUNT
-                            # Move out of the way
-                            self._ssh_thread._append_command("MOVE {} {} {} {} {} {}".format(arm_y, arm_x, 0.1 + .15, 0, 1.4, 0))
-
-                            # DROP OFF POINT
-                            self._ssh_thread._append_command("DROP {} {} {} {} {} {}".format(.007, 0.231, 0.340, 0.066, 1.284, 1.687))
-                        """
-
-                        """
-                        print("-----Printing Item List-----")
-                        for testItem in self.get_current_item_list():
-                            print(testItem.item_type)
-
-                        print("-----End of Item List-----")
-                        """
-
                         message = 'Requesting Object: %s' % requested_item.item_type
-
-                        # Update GUI based on results
-                        if self._object_removed_successfully:
-                            self._gui_thread.set_result(1, error=message, item=lest_requested_item.item_type,
-                                                        placement=lest_requested_item.placement, x=x, y=y, z=z)
-                        elif self._object_not_found:
-                            self._gui_thread.set_result(0, error="Object Not Found!", item=requested_item.item_type,
-                                                        placement=requested_item.placement, x="N/A", y="N/A", z="N/A")
-                        else:
-                            self._gui_thread.set_result(2, error=message, item=requested_item.item_type,
-                                                        placement=requested_item.placement, x=x, y=y, z=z)
 
                         time.sleep(5)
                         self._object_removed_successfully = False
@@ -362,6 +321,62 @@ class Main:
             self._logger.debug('Joining Vision Thread')
             self._vision_thread.join()
             self._gui_thread.join()
+            
+            # terminate robot connection
+            self.robot.close_connection()
+
+    def parse_config(self):
+        """
+        Helper function to get data from the config file.
+        """
+        bad_read = False
+        self._logger.debug('parsing config file...')
+        config = configparser.ConfigParser()
+        config.read('.config')
+        # for each key to a subdictionary in the config_variables dictionary...
+        for section_name in list(self.config_variables):
+            # check if the subdictionary is found in the config file
+            if section_name not in config.sections():
+                bad_read = True
+                print("Error! section " + section_name + " not found in config file, adding it")
+                # create an instance of the section in the config file for the user to fill out
+                config[section_name] = {}
+                for variable_name in list(self.config_variables[section_name]):
+                    config[section_name][str(variable_name)] = str(self.config_variables[section_name][variable_name])
+                config_file = open('.config', 'w')
+                config.write(config_file)
+
+            # for each key in the subdictionary...
+            for variable_name in list(self.config_variables[section_name]):
+                # retrieve the value from the subdictionary
+                self.config_variables[section_name][variable_name] = config.getfloat(section_name, variable_name)
+                # if the value is 0.0, then report error
+                if self.config_variables[section_name][variable_name] == 0.0:
+                    print(variable_name + ' in .config is undefined, please add value in .config file')
+                    bad_read = True
+
+        if bad_read == True:
+            self._logger.debug('parsing config file - FAILURE, quitting')
+            quit()
+        self._logger.debug('parsing config file - COMPLETE')
+        return
+
+    def convert_coordinates(self, in_x:float, in_y:float, in_coor:dict, out_coor:dict):
+        """
+        converts coordinates from the in_coor coordinate system to the out_coor coordinate system
+        in_coor and out_coor are both dictionaries with north, east, south, and west values
+        that correspond to the upper, right, lower, and left bounds of the pickable area
+        returns the x and y values of "selected_item" in terms of 
+        """
+        # first, convert the x and y coordinates of the selected item so that they are independent of the input coordinate system
+        # mid_x is the x coordinate of the item where 0.0 is the left edge of the pickable area and 1.0 is the right edge of the pickable area
+        # mid_y is the y coordinate of the item where 0.0 is the top edge of the pickable area and 1.0 is the bottom edge of the pickable area
+        mid_x = (in_x - in_coor['west'])  / (in_coor['east'] - in_coor['west'])
+        mid_y = (in_y - in_coor['north']) / (in_coor['south'] - in_coor['north'])
+        # out_x and out_y are the coordinates in terms of the output coordinate system
+        out_x = mid_x * abs(out_coor['east'] - out_coor['west']) + out_coor['west']
+        out_y = mid_y * abs(out_coor['south'] - out_coor['north']) + out_coor['north']
+        return out_x, out_y
 
     def get_camera_images(self):
         """
